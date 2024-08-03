@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort" // Add this line
 	"strings"
@@ -655,8 +656,14 @@ func main() {
 
 	r.POST("/scrape", scrapeLinkedinJobs)
 
-	log.Println("Starting server on :8080")
-	if err := r.Run(":8080"); err != nil {
+	// Get the port from the environment variable
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Default port if not specified
+	}
+
+	log.Printf("Starting server on :%s", port)
+	if err := r.Run(":" + port); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
