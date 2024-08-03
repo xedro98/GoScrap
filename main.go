@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -654,7 +655,15 @@ func main() {
 	// Add request logging middleware
 	r.Use(logRequestBody)
 
-	r.POST("/scrape", scrapeLinkedinJobs)
+	// Set a longer timeout for the /scrape endpoint
+	r.POST("/scrape", func(c *gin.Context) {
+		timeout := time.Second * 60 // Set timeout to 60 seconds
+		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
+		defer cancel()
+
+		c.Request = c.Request.WithContext(ctx)
+		scrapeLinkedinJobs(c)
+	})
 
 	// Get the port from the environment variable
 	port := os.Getenv("PORT")
