@@ -89,40 +89,27 @@ func buildLinkedinURL(params JobSearchParams) string {
 	baseURL := "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?"
 
 	queryParams := url.Values{}
-	queryParams.Add("keywords", params.Query)
-	queryParams.Add("location", strings.Join(params.Locations, ","))
-	queryParams.Add("f_TP", "")
-	queryParams.Add("sortBy", "DD")
-	queryParams.Add("start", "0")
+
+	// Add keywords without additional encoding
+	queryParams.Set("keywords", params.Query)
+
+	// Add location
+	if len(params.Locations) > 0 {
+		queryParams.Set("location", strings.Join(params.Locations, ","))
+	}
+
+	// Add sorting
+	queryParams.Set("sortBy", "DD")
+
+	// Add start parameter
+	queryParams.Set("start", "0")
 
 	if filters, ok := params.Options["filters"].(map[string]interface{}); ok {
-		if types, ok := filters["type"].([]interface{}); ok {
-			jobTypes := make([]string, 0)
-			for _, t := range types {
-				switch t {
-				case "FULL_TIME":
-					jobTypes = append(jobTypes, "F")
-				case "PART_TIME":
-					jobTypes = append(jobTypes, "P")
-				case "CONTRACT":
-					jobTypes = append(jobTypes, "C")
-				case "TEMPORARY":
-					jobTypes = append(jobTypes, "T")
-				case "VOLUNTEER":
-					jobTypes = append(jobTypes, "V")
-				case "INTERNSHIP":
-					jobTypes = append(jobTypes, "I")
-				}
-			}
-			if len(jobTypes) > 0 {
-				queryParams.Add("f_JT", strings.Join(jobTypes, ","))
-			}
-		}
-
-		if experience, ok := filters["experience"].([]interface{}); ok {
+		// Experience Levels
+		if experience, ok := filters["experience"].([]interface{}); ok && len(experience) > 0 {
 			expLevels := make([]string, 0)
 			for _, e := range experience {
-				switch e {
+				switch e.(string) {
 				case "INTERNSHIP":
 					expLevels = append(expLevels, "1")
 				case "ENTRY_LEVEL":
@@ -138,14 +125,15 @@ func buildLinkedinURL(params JobSearchParams) string {
 				}
 			}
 			if len(expLevels) > 0 {
-				queryParams.Add("f_E", strings.Join(expLevels, ","))
+				queryParams.Set("f_E", strings.Join(expLevels, ","))
 			}
 		}
 
-		if onSiteOrRemote, ok := filters["onSiteOrRemote"].([]interface{}); ok {
+		// Remote Work Options
+		if onSiteOrRemote, ok := filters["onSiteOrRemote"].([]interface{}); ok && len(onSiteOrRemote) > 0 {
 			remoteTypes := make([]string, 0)
 			for _, r := range onSiteOrRemote {
-				switch r {
+				switch r.(string) {
 				case "ON_SITE":
 					remoteTypes = append(remoteTypes, "1")
 				case "REMOTE":
@@ -155,7 +143,31 @@ func buildLinkedinURL(params JobSearchParams) string {
 				}
 			}
 			if len(remoteTypes) > 0 {
-				queryParams.Add("f_WRA", strings.Join(remoteTypes, ","))
+				queryParams.Set("f_WRA", strings.Join(remoteTypes, ","))
+			}
+		}
+
+		// Job Types (if needed)
+		if types, ok := filters["type"].([]interface{}); ok && len(types) > 0 {
+			jobTypes := make([]string, 0)
+			for _, t := range types {
+				switch t.(string) {
+				case "FULL_TIME":
+					jobTypes = append(jobTypes, "F")
+				case "PART_TIME":
+					jobTypes = append(jobTypes, "P")
+				case "CONTRACT":
+					jobTypes = append(jobTypes, "C")
+				case "TEMPORARY":
+					jobTypes = append(jobTypes, "T")
+				case "VOLUNTEER":
+					jobTypes = append(jobTypes, "V")
+				case "INTERNSHIP":
+					jobTypes = append(jobTypes, "I")
+				}
+			}
+			if len(jobTypes) > 0 {
+				queryParams.Set("f_JT", strings.Join(jobTypes, ","))
 			}
 		}
 	}
