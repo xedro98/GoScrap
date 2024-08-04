@@ -114,7 +114,9 @@ func buildLinkedinURL(params JobSearchParams) string {
 					jobTypes = append(jobTypes, "I")
 				}
 			}
-			queryParams.Add("f_JT", strings.Join(jobTypes, ","))
+			if len(jobTypes) > 0 {
+				queryParams.Add("f_JT", strings.Join(jobTypes, ","))
+			}
 		}
 
 		if experience, ok := filters["experience"].([]interface{}); ok {
@@ -135,7 +137,9 @@ func buildLinkedinURL(params JobSearchParams) string {
 					expLevels = append(expLevels, "6")
 				}
 			}
-			queryParams.Add("f_E", strings.Join(expLevels, ","))
+			if len(expLevels) > 0 {
+				queryParams.Add("f_E", strings.Join(expLevels, ","))
+			}
 		}
 
 		if onSiteOrRemote, ok := filters["onSiteOrRemote"].([]interface{}); ok {
@@ -150,7 +154,9 @@ func buildLinkedinURL(params JobSearchParams) string {
 					remoteTypes = append(remoteTypes, "3")
 				}
 			}
-			queryParams.Add("f_WRA", strings.Join(remoteTypes, ","))
+			if len(remoteTypes) > 0 {
+				queryParams.Add("f_WRA", strings.Join(remoteTypes, ","))
+			}
 		}
 	}
 
