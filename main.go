@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -11,7 +10,6 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"sort" // Add this line
 	"strings"
@@ -412,23 +410,15 @@ func modifySearchParams(params JobSearchParams) JobSearchParams {
 			}
 			filters["type"] = types
 		}
-		if experience, ok := filters["experience"].([]interface{}); ok {
-			found := false
-			for _, e := range experience {
-				if e == "ENTRY_LEVEL" {
-					found = true
-					break
-				}
-			}
-			if !found {
-				experience = append(experience, "ENTRY_LEVEL")
-			}
-			filters["experience"] = experience
+
+		// Only add ENTRY_LEVEL if no experience filter is provided
+		if experience, ok := filters["experience"].([]interface{}); !ok || len(experience) == 0 {
+			filters["experience"] = []interface{}{"ENTRY_LEVEL"}
 		}
 	} else {
 		params.Options["filters"] = map[string]interface{}{
-			"type":       []string{"FULL_TIME"},
-			"experience": []string{"ENTRY_LEVEL"},
+			"type":       []interface{}{"FULL_TIME"},
+			"experience": []interface{}{"ENTRY_LEVEL"},
 		}
 	}
 	log.Println("Modified search parameters to broaden the search by adjusting filters.")
@@ -655,24 +645,10 @@ func main() {
 	// Add request logging middleware
 	r.Use(logRequestBody)
 
-	// Set a longer timeout for the /scrape endpoint
-	r.POST("/scrape", func(c *gin.Context) {
-		timeout := time.Second * 60 // Set timeout to 60 seconds
-		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
-		defer cancel()
+	r.POST("/scrape", scrapeLinkedinJobs)
 
-		c.Request = c.Request.WithContext(ctx)
-		scrapeLinkedinJobs(c)
-	})
-
-	// Get the port from the environment variable
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080" // Default port if not specified
-	}
-
-	log.Printf("Starting server on :%s", port)
-	if err := r.Run(":" + port); err != nil {
+	log.Println("Starting server on :8080")
+	if err := r.Run(":8080"); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
