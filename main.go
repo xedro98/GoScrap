@@ -105,24 +105,22 @@ func buildLinkedinURL(params JobSearchParams) string {
 	queryParams.Set("start", "0")
 
 	if filters, ok := params.Options["filters"].(map[string]interface{}); ok {
+		// Job Types
+		if types, ok := filters["type"].([]interface{}); ok && len(types) > 0 {
+			jobTypes := make([]string, 0)
+			for _, t := range types {
+				jobTypes = append(jobTypes, t.(string))
+			}
+			if len(jobTypes) > 0 {
+				queryParams.Set("f_JT", strings.Join(jobTypes, ","))
+			}
+		}
+
 		// Experience Levels
 		if experience, ok := filters["experience"].([]interface{}); ok && len(experience) > 0 {
 			expLevels := make([]string, 0)
 			for _, e := range experience {
-				switch e.(string) {
-				case "INTERNSHIP":
-					expLevels = append(expLevels, "1")
-				case "ENTRY_LEVEL":
-					expLevels = append(expLevels, "2")
-				case "ASSOCIATE":
-					expLevels = append(expLevels, "3")
-				case "MID_SENIOR_LEVEL":
-					expLevels = append(expLevels, "4")
-				case "DIRECTOR":
-					expLevels = append(expLevels, "5")
-				case "EXECUTIVE":
-					expLevels = append(expLevels, "6")
-				}
+				expLevels = append(expLevels, e.(string))
 			}
 			if len(expLevels) > 0 {
 				queryParams.Set("f_E", strings.Join(expLevels, ","))
@@ -144,30 +142,6 @@ func buildLinkedinURL(params JobSearchParams) string {
 			}
 			if len(remoteTypes) > 0 {
 				queryParams.Set("f_WRA", strings.Join(remoteTypes, ","))
-			}
-		}
-
-		// Job Types (if needed)
-		if types, ok := filters["type"].([]interface{}); ok && len(types) > 0 {
-			jobTypes := make([]string, 0)
-			for _, t := range types {
-				switch t.(string) {
-				case "FULL_TIME":
-					jobTypes = append(jobTypes, "F")
-				case "PART_TIME":
-					jobTypes = append(jobTypes, "P")
-				case "CONTRACT":
-					jobTypes = append(jobTypes, "C")
-				case "TEMPORARY":
-					jobTypes = append(jobTypes, "T")
-				case "VOLUNTEER":
-					jobTypes = append(jobTypes, "V")
-				case "INTERNSHIP":
-					jobTypes = append(jobTypes, "I")
-				}
-			}
-			if len(jobTypes) > 0 {
-				queryParams.Set("f_JT", strings.Join(jobTypes, ","))
 			}
 		}
 	}
