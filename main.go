@@ -637,6 +637,11 @@ func main() {
 	// Add request logging middleware
 	r.Use(logRequestBody)
 
+	// Add root route
+	r.GET("/", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
+
 	r.POST("/scrape", scrapeLinkedinJobs)
 
 	log.Println("Starting server on :8080")
