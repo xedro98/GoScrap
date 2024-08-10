@@ -550,7 +550,7 @@ func scrapeLinkedinJobs(c *gin.Context) {
 
 	log.Printf("Total jobs fetched: %d", len(jobs))
 
-	// Filter out existing job IDs
+	// Filter out existing job IDs provided by the user
 	existingJobIDs := make(map[string]bool)
 	for _, id := range searchParams.ExistingJobIds {
 		existingJobIDs[id] = true
