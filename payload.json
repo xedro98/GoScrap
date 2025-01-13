@@ -1,0 +1,5 @@
+{
+    "query": "Software Engineer",
+    "locations": ["New York"],
+    "limit": 10
+  }

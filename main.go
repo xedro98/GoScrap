@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -10,16 +13,22 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"regexp"
-	"sort" // Add this line
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/sony/gobreaker"
 	"golang.org/x/net/html"
+	"golang.org/x/time/rate"
 )
 
 // JobSearchParams represents the parameters for a job search
@@ -34,21 +43,124 @@ type JobSearchParams struct {
 
 // JobInfo represents the information about a job
 type JobInfo struct {
-	JobID           string `json:"jobId"`
-	Title           string `json:"title"`
-	Company         string `json:"company"`
-	CompanyLink     string `json:"companyLink,omitempty"`
-	CompanyImgLink  string `json:"companyImgLink,omitempty"`
-	Place           string `json:"place"`
-	Date            string `json:"date,omitempty"`
-	Link            string `json:"link"`
-	SeniorityLevel  string `json:"seniorityLevel,omitempty"`
-	JobFunction     string `json:"jobFunction,omitempty"`
-	EmploymentType  string `json:"employmentType,omitempty"`
-	Description     string `json:"description"`
-	DescriptionHTML string `json:"descriptionHTML"`
-	ApplyLink       string `json:"applyLink,omitempty"`
-	CompanyApplyURL string `json:"companyApplyUrl,omitempty"`
+	JobID            string   `json:"jobId"`
+	Title            string   `json:"title"`
+	Company          string   `json:"company"`
+	CompanyLink      string   `json:"companyLink,omitempty"`
+	CompanyImgLink   string   `json:"companyImgLink,omitempty"`
+	Place            string   `json:"place"`
+	Date             string   `json:"date,omitempty"`
+	Link             string   `json:"link"`
+	SeniorityLevel   string   `json:"seniorityLevel,omitempty"`
+	JobFunction      string   `json:"jobFunction,omitempty"`
+	EmploymentType   string   `json:"employmentType,omitempty"`
+	Description      string   `json:"description"`
+	DescriptionHTML  string   `json:"descriptionHTML"`
+	ApplyLink        string   `json:"applyLink,omitempty"`
+	CompanyApplyURL  string   `json:"companyApplyUrl,omitempty"`
+	Salary           string   `json:"salary,omitempty"`
+	FeaturedBenefits []string `json:"featuredBenefits,omitempty"`
+}
+
+// ScrapeTask represents a task in the queue
+type ScrapeTask struct {
+	Params JobSearchParams
+	Result chan []JobInfo
+}
+
+// GlassdoorResponse represents the response from Glassdoor API
+type GlassdoorResponse struct {
+	Response struct {
+		Employers []struct {
+			Name            string `json:"name"`
+			NumberOfRatings int    `json:"numberOfRatings"`
+		} `json:"employers"`
+	} `json:"response"`
+}
+
+// Adaptive Rate Limiter
+type AdaptiveRateLimiter struct {
+	limit     rate.Limit
+	burst     int
+	limiter   *rate.Limiter
+	successes int
+	failures  int
+	mu        sync.Mutex
+}
+
+func NewAdaptiveRateLimiter(initialLimit rate.Limit, burst int) *AdaptiveRateLimiter {
+	return &AdaptiveRateLimiter{
+		limit:   initialLimit,
+		burst:   burst,
+		limiter: rate.NewLimiter(initialLimit, burst),
+	}
+}
+
+func (a *AdaptiveRateLimiter) Wait(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.failures > 5 {
+		a.limit /= 3
+		a.failures = 0
+		a.successes = 0
+		a.limiter.SetLimit(a.limit)
+	} else if a.successes > 50 {
+		a.limit *= 1.2
+		a.failures = 0
+		a.successes = 0
+		a.limiter.SetLimit(a.limit)
+	}
+
+	return a.limiter.Wait(ctx)
+}
+
+func (a *AdaptiveRateLimiter) Success() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.successes++
+}
+
+func (a *AdaptiveRateLimiter) Failure() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.failures++
+}
+
+var adaptiveLimiter = NewAdaptiveRateLimiter(rate.Every(5*time.Second), 1)
+
+// Intelligent Retry Mechanism
+func intelligentRetry(operation func() (int, error)) (int, error) {
+	baseDelay := 1 * time.Second
+	maxDelay := 1 * time.Hour
+	maxRetries := 10
+
+	for i := 0; i < maxRetries; i++ {
+		statusCode, err := operation()
+		if err == nil {
+			return statusCode, nil
+		}
+
+		if i == maxRetries-1 {
+			return statusCode, err
+		}
+
+		if statusCode == 429 || strings.Contains(err.Error(), "rate limit") {
+			delay := time.Duration(math.Pow(2, float64(i))) * baseDelay
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			jitter := time.Duration(rand.Int63n(int64(delay) / 2))
+			delay += jitter
+
+			log.Printf("Rate limited. Retrying in %v", delay)
+			time.Sleep(delay)
+		} else {
+			return statusCode, err
+		}
+	}
+
+	return 0, fmt.Errorf("max retries exceeded")
 }
 
 var (
@@ -61,21 +173,74 @@ var (
 	}
 
 	proxies = []string{
-		"45.127.248.127:5128:jvnarlhe:goxv0xi2iwdo",
-		"207.244.217.165:6712:jvnarlhe:goxv0xi2iwdo",
-		"134.73.69.7:5997:jvnarlhe:goxv0xi2iwdo",
-		"64.64.118.149:6732:jvnarlhe:goxv0xi2iwdo",
-		"157.52.253.244:6204:jvnarlhe:goxv0xi2iwdo",
-		"167.160.180.203:6754:jvnarlhe:goxv0xi2iwdo",
-		"166.88.58.10:5735:jvnarlhe:goxv0xi2iwdo",
-		"173.0.9.70:5653:jvnarlhe:goxv0xi2iwdo",
-		"204.44.69.89:6342:jvnarlhe:goxv0xi2iwdo",
-		"173.0.9.209:5792:jvnarlhe:goxv0xi2iwdo",
+		"p.webshare.io:80:zxvygfrs:6z2d476mdagx",
 	}
 
 	proxyIndex = 0
 	proxyMutex sync.Mutex
+
+	taskQueue     chan ScrapeTask
+	workerCount   = 20
+	maxQueueSize  = 100
+	workerControl = make(chan bool, workerCount)
+
+	limiter = rate.NewLimiter(rate.Every(time.Second), 5) // 5 requests per second
+
+	httpClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+		},
+		Timeout: 30 * time.Second,
+	}
+
+	cb *gobreaker.CircuitBreaker
+
+	glassdoorCache      = make(map[string]bool)
+	glassdoorCacheMutex sync.RWMutex
+	glassdoorPartnerID  = "233203"
+	glassdoorPartnerKey = "jrTfWk5uhyu"
+	ratingThreshold     = 5
 )
+
+// Global rate limiter for job status checks
+var jobStatusLimiter = rate.NewLimiter(rate.Every(5*time.Second), 1)
+
+// Circuit breaker for job status checks
+var jobStatusCB *gobreaker.CircuitBreaker
+
+func init() {
+	taskQueue = make(chan ScrapeTask, maxQueueSize)
+	for i := 0; i < workerCount; i++ {
+		go worker(i)
+	}
+
+	var st gobreaker.Settings
+	st.Name = "LinkedIn"
+	st.MaxRequests = 5
+	st.Interval = 5 * time.Second
+	st.Timeout = 30 * time.Second
+	st.ReadyToTrip = func(counts gobreaker.Counts) bool {
+		failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+		return counts.Requests >= 3 && failureRatio >= 0.6
+	}
+	cb = gobreaker.NewCircuitBreaker(st)
+}
+
+func worker(id int) {
+	for task := range taskQueue {
+		log.Printf("Worker %d processing task", id)
+		jobs, err := scrapeJobs(task.Params)
+		if err != nil {
+			log.Printf("Worker %d encountered error: %v", id, err)
+			task.Result <- nil
+		} else {
+			task.Result <- jobs
+		}
+		<-workerControl
+	}
+}
 
 func getNextProxy() string {
 	proxyMutex.Lock()
@@ -87,115 +252,214 @@ func getNextProxy() string {
 
 func buildLinkedinURL(params JobSearchParams) string {
 	baseURL := "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?"
-
 	queryParams := url.Values{}
-
-	// Add keywords without additional encoding
 	queryParams.Set("keywords", params.Query)
-
-	// Add location
 	if len(params.Locations) > 0 {
 		queryParams.Set("location", strings.Join(params.Locations, ","))
 	}
-
-	// Add sorting
 	queryParams.Set("sortBy", "DD")
-
-	// Add start parameter
 	queryParams.Set("start", "0")
-
-	if filters, ok := params.Options["filters"].(map[string]interface{}); ok {
-		// Job Types
-		if types, ok := filters["type"].([]interface{}); ok && len(types) > 0 {
-			jobTypes := make([]string, 0)
-			for _, t := range types {
-				jobTypes = append(jobTypes, t.(string))
-			}
-			if len(jobTypes) > 0 {
-				queryParams.Set("f_JT", strings.Join(jobTypes, ","))
-			}
-		}
-
-		// Experience Levels
-		if experience, ok := filters["experience"].([]interface{}); ok && len(experience) > 0 {
-			expLevels := make([]string, 0)
-			for _, e := range experience {
-				expLevels = append(expLevels, e.(string))
-			}
-			if len(expLevels) > 0 {
-				queryParams.Set("f_E", strings.Join(expLevels, ","))
-			}
-		}
-
-		// Remote Work Options
-		if onSiteOrRemote, ok := filters["onSiteOrRemote"].([]interface{}); ok && len(onSiteOrRemote) > 0 {
-			remoteTypes := make([]string, 0)
-			for _, r := range onSiteOrRemote {
-				switch r.(string) {
-				case "ON_SITE":
-					remoteTypes = append(remoteTypes, "1")
-				case "REMOTE":
-					remoteTypes = append(remoteTypes, "2")
-				case "HYBRID":
-					remoteTypes = append(remoteTypes, "3")
+	// Add nil check for Options
+	if params.Options != nil {
+		// Add type assertion check for filters
+		if filtersInterface, exists := params.Options["filters"]; exists && filtersInterface != nil {
+			filters, ok := filtersInterface.(map[string]interface{})
+			if ok {
+				// Handle job types
+				if typesInterface, exists := filters["type"]; exists && typesInterface != nil {
+					if types, ok := typesInterface.([]interface{}); ok && len(types) > 0 {
+						jobTypes := make([]string, 0)
+						for _, t := range types {
+							if typeStr, ok := t.(string); ok {
+								jobTypes = append(jobTypes, typeStr)
+							}
+						}
+						if len(jobTypes) > 0 {
+							queryParams.Set("f_JT", strings.Join(jobTypes, ","))
+						}
+					}
 				}
-			}
-			if len(remoteTypes) > 0 {
-				queryParams.Set("f_WRA", strings.Join(remoteTypes, ","))
+				// Handle experience levels
+				if expInterface, exists := filters["experience"]; exists && expInterface != nil {
+					if experience, ok := expInterface.([]interface{}); ok && len(experience) > 0 {
+						expLevels := make([]string, 0)
+						for _, e := range experience {
+							if expStr, ok := e.(string); ok {
+								expLevels = append(expLevels, expStr)
+							}
+						}
+						if len(expLevels) > 0 {
+							queryParams.Set("f_E", strings.Join(expLevels, ","))
+						}
+					}
+				}
+				// Handle remote/onsite preferences
+				if remoteInterface, exists := filters["onSiteOrRemote"]; exists && remoteInterface != nil {
+					if onSiteOrRemote, ok := remoteInterface.([]interface{}); ok && len(onSiteOrRemote) > 0 {
+						remoteTypes := make([]string, 0)
+						for _, r := range onSiteOrRemote {
+							if remoteStr, ok := r.(string); ok {
+								switch remoteStr {
+								case "ON_SITE":
+									remoteTypes = append(remoteTypes, "1")
+								case "REMOTE":
+									remoteTypes = append(remoteTypes, "2")
+								case "HYBRID":
+									remoteTypes = append(remoteTypes, "3")
+								}
+							}
+						}
+						if len(remoteTypes) > 0 {
+							queryParams.Set("f_WRA", strings.Join(remoteTypes, ","))
+						}
+					}
+				}
 			}
 		}
 	}
-
 	return baseURL + queryParams.Encode()
 }
 
 func fetchPage(url string, retries int, minDelay, maxDelay, postLoadDelay time.Duration) (string, error) {
-	client := &http.Client{
-		Timeout: 30 * time.Second, // Increase timeout
-	}
+	var lastErr error
+	backoff := minDelay
 
 	for attempt := 0; attempt < retries; attempt++ {
+		proxyURL := getNextProxy()
+		client := createClientWithProxy(proxyURL)
+
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			return "", err
 		}
 
-		req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
+		// Enhanced headers to look more like a real browser
+		userAgent := userAgents[rand.Intn(len(userAgents))]
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+		req.Header.Set("Connection", "keep-alive")
+		req.Header.Set("Upgrade-Insecure-Requests", "1")
+		req.Header.Set("Sec-Fetch-Dest", "document")
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		req.Header.Set("Sec-Fetch-Site", "none")
+		req.Header.Set("Sec-Fetch-User", "?1")
+		req.Header.Set("Cache-Control", "max-age=0")
 
-		log.Printf("Attempt %d/%d: Fetching URL %s", attempt+1, retries, url)
+		log.Printf("Attempt %d: Fetching URL: %s with User-Agent: %s", attempt+1, url, userAgent)
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("Error fetching page: %v", err)
-			time.Sleep(time.Duration(math.Min(60, math.Pow(2, float64(attempt)))) * time.Second)
+			log.Printf("Request error on attempt %d: %v", attempt+1, err)
+			lastErr = err
+			time.Sleep(backoff)
+			backoff = calculateBackoff(backoff, maxDelay)
 			continue
 		}
+
+		log.Printf("Response status code: %d", resp.StatusCode)
+
 		defer resp.Body.Close()
 
-		log.Printf("HTTP request to %s returned status code %d", url, resp.StatusCode)
+		// Read response body
+		var bodyBytes []byte
+		if resp.Header.Get("Content-Encoding") == "gzip" {
+			reader, err := gzip.NewReader(resp.Body)
+			if err != nil {
+				log.Printf("Error creating gzip reader: %v", err)
+				continue
+			}
+			defer reader.Close()
+			bodyBytes, err = ioutil.ReadAll(reader)
+		} else {
+			bodyBytes, err = ioutil.ReadAll(resp.Body)
+		}
+
+		if err != nil {
+			log.Printf("Error reading response body: %v", err)
+			continue
+		}
+
+		body := string(bodyBytes)
 
 		if resp.StatusCode == 429 {
-			if attempt < retries-1 {
-				delay := time.Duration(math.Min(60, math.Pow(2, float64(attempt)))) * time.Second
-				log.Printf("Rate limit hit. Retrying in %v seconds...", delay.Seconds())
-				time.Sleep(delay)
-				continue
-			} else {
-				return "", fmt.Errorf("rate limit hit after multiple retries")
+			adaptiveLimiter.Failure()
+			retryAfter := resp.Header.Get("Retry-After")
+			sleepDuration := parseRetryAfter(retryAfter)
+			if sleepDuration == 0 {
+				sleepDuration = backoff
 			}
+			log.Printf("Rate limited (429). Sleeping for %v", sleepDuration)
+			time.Sleep(sleepDuration)
+			backoff = calculateBackoff(backoff, maxDelay)
+			continue
 		}
 
-		time.Sleep(postLoadDelay)
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return "", err
+		if resp.StatusCode != 200 {
+			log.Printf("Unexpected status code %d", resp.StatusCode)
+			continue
 		}
 
-		return string(body), nil
+		// Check if the response contains a CAPTCHA or block page
+		if strings.Contains(body, "captcha") || strings.Contains(body, "blocked") || strings.Contains(body, "denied") {
+			log.Printf("Detected CAPTCHA/blocking page")
+			adaptiveLimiter.Failure()
+			time.Sleep(backoff)
+			backoff = calculateBackoff(backoff, maxDelay)
+			continue
+		}
+
+		adaptiveLimiter.Success()
+		return body, nil
 	}
 
-	return "", fmt.Errorf("failed to fetch page after %d attempts", retries)
+	return "", fmt.Errorf("max retries exceeded: %v", lastErr)
+}
+
+func createClientWithProxy(proxyStr string) *http.Client {
+	parts := strings.Split(proxyStr, ":")
+	proxyURL := fmt.Sprintf("http://%s:%s@%s:%s", parts[2], parts[3], parts[0], parts[1])
+
+	log.Printf("Setting up proxy with URL: %s", strings.Replace(proxyURL, parts[3], "****", 1))
+
+	proxy, err := url.Parse(proxyURL)
+	if err != nil {
+		log.Printf("Error parsing proxy URL: %v", err)
+		return httpClient
+	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxy),
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+
+	// Test the proxy connection
+	testResp, err := client.Get("https://ipv4.webshare.io/")
+	if err != nil {
+		log.Printf("Proxy test failed: %v", err)
+		return httpClient
+	}
+	defer testResp.Body.Close()
+
+	if testResp.StatusCode != 200 {
+		log.Printf("Proxy test failed with status code: %d", testResp.StatusCode)
+		return httpClient
+	}
+
+	log.Printf("Proxy test successful")
+	return client
 }
 
 func safeFindString(doc *goquery.Document, selector string) string {
@@ -213,48 +477,78 @@ func safeFindAttribute(doc *goquery.Document, selector, attr string) string {
 
 func paginateJobSearch(baseURL string, requiredJobs, maxPages int) ([]JobInfo, error) {
 	var allJobs []JobInfo
-	page := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	errors := make(chan error, maxPages)
+	semaphore := make(chan struct{}, 3) // Limit concurrent requests
 
-	for len(allJobs) < requiredJobs && page < maxPages {
-		url := fmt.Sprintf("%s&start=%d", baseURL, page*25)
-		pageContent, err := fetchPage(url, 5, 1*time.Second, 3*time.Second, 2*time.Second)
-		if err != nil {
-			return nil, err
-		}
+	for page := 0; page < maxPages && len(allJobs) < requiredJobs; page++ {
+		wg.Add(1)
+		go func(pageNum int) {
+			defer wg.Done()
+			semaphore <- struct{}{}        // Acquire semaphore
+			defer func() { <-semaphore }() // Release semaphore
 
-		doc, err := goquery.NewDocumentFromReader(strings.NewReader(pageContent))
-		if err != nil {
-			return nil, err
-		}
-
-		jobsOnPage := doc.Find("li")
-		if jobsOnPage.Length() == 0 {
-			break
-		}
-
-		jobsOnPage.Each(func(i int, s *goquery.Selection) {
-			job := JobInfo{}
-			baseCard := s.Find("div.base-card")
-			if baseCard.Length() > 0 {
-				job.JobID = baseCard.AttrOr("data-entity-urn", "")
-				job.JobID = strings.TrimPrefix(job.JobID, "urn:li:jobPosting:")
-				job.Link = baseCard.Find("a.base-card__full-link").AttrOr("href", "")
-				job.Title = baseCard.Find("h3.base-search-card__title").Text()
-				job.Company = baseCard.Find("h4.base-search-card__subtitle").Text()
-				job.Place = baseCard.Find("span.job-search-card__location").Text()
-				job.Date = baseCard.Find("time.job-search-card__listdate").AttrOr("datetime", "")
+			url := fmt.Sprintf("%s&start=%d", baseURL, pageNum*25)
+			pageContent, err := fetchPage(url, 5, 1*time.Second, 3*time.Second, 2*time.Second)
+			if err != nil {
+				errors <- err
+				return
 			}
-			allJobs = append(allJobs, job)
-		})
 
-		page++
-		time.Sleep(time.Duration(rand.Intn(3)+2) * time.Second)
+			jobs := parseJobsFromPage(pageContent)
+
+			mu.Lock()
+			allJobs = append(allJobs, jobs...)
+			mu.Unlock()
+		}(page)
 	}
 
-	if len(allJobs) < requiredJobs {
-		return allJobs, nil
+	wg.Wait()
+	close(errors)
+
+	// Check for errors
+	for err := range errors {
+		log.Printf("Error during pagination: %v", err)
 	}
-	return allJobs[:requiredJobs], nil
+
+	return allJobs, nil
+}
+
+func isWellKnownCompany(company string) bool {
+	glassdoorCacheMutex.RLock()
+	if isWellKnown, exists := glassdoorCache[company]; exists {
+		glassdoorCacheMutex.RUnlock()
+		return isWellKnown
+	}
+	glassdoorCacheMutex.RUnlock()
+
+	apiURL := fmt.Sprintf("https://api.glassdoor.com/api/api.htm?v=1&format=json&t.p=%s&t.k=%s&action=employers&q=%s",
+		glassdoorPartnerID, glassdoorPartnerKey, url.QueryEscape(company))
+
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		log.Printf("Error fetching Glassdoor data for %s: %v", company, err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	var glassdoorResp GlassdoorResponse
+	if err := json.NewDecoder(resp.Body).Decode(&glassdoorResp); err != nil {
+		log.Printf("Error decoding Glassdoor response for %s: %v", company, err)
+		return false
+	}
+
+	isWellKnown := false
+	if len(glassdoorResp.Response.Employers) > 0 {
+		isWellKnown = glassdoorResp.Response.Employers[0].NumberOfRatings >= ratingThreshold
+	}
+
+	glassdoorCacheMutex.Lock()
+	glassdoorCache[company] = isWellKnown
+	glassdoorCacheMutex.Unlock()
+
+	return isWellKnown
 }
 
 func scrapeJobs(params JobSearchParams) ([]JobInfo, error) {
@@ -264,6 +558,7 @@ func scrapeJobs(params JobSearchParams) ([]JobInfo, error) {
 
 	allJobsOnPage, err := paginateJobSearch(searchURL, params.Limit*2, 5)
 	if err != nil {
+		log.Printf("Error in initial job search: %v", err)
 		return nil, fmt.Errorf("error in initial job search: %v", err)
 	}
 
@@ -273,6 +568,7 @@ func scrapeJobs(params JobSearchParams) ([]JobInfo, error) {
 		searchURL = buildLinkedinURL(params)
 		additionalJobs, err := paginateJobSearch(searchURL, params.Limit*2-len(allJobsOnPage), 5)
 		if err != nil {
+			log.Printf("Error in additional job search: %v", err)
 			return nil, fmt.Errorf("error in additional job search: %v", err)
 		}
 		allJobsOnPage = append(allJobsOnPage, additionalJobs...)
@@ -292,6 +588,7 @@ func scrapeJobs(params JobSearchParams) ([]JobInfo, error) {
 	jobDetailsChan := make(chan JobInfo, len(allJobsOnPage))
 	errorChan := make(chan error, len(allJobsOnPage))
 	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 5) // Limit concurrent requests
 
 	for _, job := range allJobsOnPage {
 		if existingJobIDs[job.JobID] {
@@ -302,6 +599,9 @@ func scrapeJobs(params JobSearchParams) ([]JobInfo, error) {
 		wg.Add(1)
 		go func(job JobInfo) {
 			defer wg.Done()
+			semaphore <- struct{}{}        // Acquire semaphore
+			defer func() { <-semaphore }() // Release semaphore
+
 			jobDetails, err := fetchJobDetails(job, jobURL, maxRetries)
 			if err != nil {
 				errorChan <- fmt.Errorf("error fetching job details for job ID %s: %v", job.JobID, err)
@@ -319,13 +619,19 @@ func scrapeJobs(params JobSearchParams) ([]JobInfo, error) {
 
 	var jobDetails []JobInfo
 	for job := range jobDetailsChan {
-		jobDetails = append(jobDetails, job)
-		if len(jobDetails) >= params.Limit {
-			break
+		if isWellKnownCompany(job.Company) {
+			jobDetails = append(jobDetails, job)
+			if len(jobDetails) >= params.Limit {
+				break
+			}
 		}
 	}
 
-	// Check for any errors
+	if len(jobDetails) == 0 {
+		log.Println("No job details were successfully scraped")
+		return nil, fmt.Errorf("no job details were successfully scraped")
+	}
+
 	var errors []string
 	for err := range errorChan {
 		errors = append(errors, err.Error())
@@ -333,7 +639,6 @@ func scrapeJobs(params JobSearchParams) ([]JobInfo, error) {
 
 	if len(errors) > 0 {
 		log.Printf("Encountered %d errors while fetching job details", len(errors))
-		// You can decide how to handle these errors. For now, we'll just log them.
 		for _, errStr := range errors {
 			log.Println(errStr)
 		}
@@ -358,6 +663,7 @@ func fetchJobDetails(job JobInfo, jobURL string, maxRetries int) (JobInfo, error
 		doc, err := goquery.NewDocumentFromReader(strings.NewReader(jobDetailContent))
 		if err != nil {
 			detailRetryCount++
+			log.Printf("Error parsing job details HTML for job ID: %s. Retry %d/%d. Error: %v", job.JobID, detailRetryCount, maxRetries, err)
 			continue
 		}
 
@@ -367,11 +673,32 @@ func fetchJobDetails(job JobInfo, jobURL string, maxRetries int) (JobInfo, error
 
 		job.CompanyLink = safeFindAttribute(doc, "a.topcard__org-name-link", "href")
 		job.CompanyImgLink = safeFindAttribute(doc, "img.artdeco-entity-image", "data-delayed-url")
-		job.SeniorityLevel = strings.TrimSpace(safeFindString(doc, "li.description__job-criteria-item:contains('Seniority level')"))
+		job.SeniorityLevel = strings.TrimSpace(safeFindString(doc, "li.description__job-criteria-item:contains('Seniority level') span.description__job-criteria-text"))
 		job.EmploymentType = strings.TrimSpace(safeFindString(doc, "li.description__job-criteria-item:contains('Employment type') span.description__job-criteria-text"))
-		job.JobFunction = strings.TrimSpace(safeFindString(doc, "li.description__job-criteria-item:contains('Job function')"))
+		job.JobFunction = strings.TrimSpace(safeFindString(doc, "li.description__job-criteria-item:contains('Job function') span.description__job-criteria-text"))
 
-		// Clean up job title and company name
+		// Add salary information
+		job.Salary = strings.TrimSpace(safeFindString(doc, "div.salary.compensation__salary"))
+
+		// Add featured benefits
+		var benefits []string
+		doc.Find("li.featured-benefits__list-item .benefit__text").Each(func(i int, s *goquery.Selection) {
+			benefit := strings.TrimSpace(s.Text())
+			if benefit != "" {
+				benefits = append(benefits, benefit)
+			}
+		})
+		job.FeaturedBenefits = benefits
+
+		// Fetch ApplyLink and CompanyApplyURL
+		applyLink, err := fetchApplyLink(job.Link)
+		if err != nil {
+			log.Printf("Error fetching apply link for job %s: %v", job.JobID, err)
+		} else {
+			job.CompanyApplyURL = applyLink
+			job.ApplyLink = applyLink
+		}
+
 		job.Title = strings.Join(strings.Fields(job.Title), " ")
 		job.Company = strings.Join(strings.Fields(job.Company), " ")
 
@@ -403,7 +730,6 @@ func modifySearchParams(params JobSearchParams) JobSearchParams {
 			filters["type"] = types
 		}
 
-		// Only add ENTRY_LEVEL if no experience filter is provided
 		if experience, ok := filters["experience"].([]interface{}); !ok || len(experience) == 0 {
 			filters["experience"] = []interface{}{"ENTRY_LEVEL"}
 		}
@@ -440,7 +766,6 @@ func fetchApplyLink(jobURL string) (string, error) {
 			return "", fmt.Errorf("failed to fetch apply link for %s after %d attempts: %v", fullJobURL, retries, err)
 		}
 
-		// Look for the specific code block containing job data
 		re := regexp.MustCompile(`<code id="bpr-guid-\d+">(.*?)</code>`)
 		match := re.FindStringSubmatch(content)
 		if len(match) > 1 {
@@ -457,7 +782,6 @@ func fetchApplyLink(jobURL string) (string, error) {
 			}
 		}
 
-		// Check for the applyUrl code block
 		applyURLRe := regexp.MustCompile(`<code id="applyUrl" style="display: none"><!--"(.*?)"--></code>`)
 		applyURLMatch := applyURLRe.FindStringSubmatch(content)
 		if len(applyURLMatch) > 1 {
@@ -466,10 +790,8 @@ func fetchApplyLink(jobURL string) (string, error) {
 			return extractExternalURL(applyURL), nil
 		}
 
-		// Fallback methods if the primary method fails
 		doc, err := goquery.NewDocumentFromReader(strings.NewReader(content))
 		if err == nil {
-			// Check for offsite apply button
 			applyButton := doc.Find("a[data-tracking-control-name='public_jobs_apply-link-offsite']")
 			if applyButton.Length() > 0 {
 				applyURL, exists := applyButton.Attr("href")
@@ -479,7 +801,6 @@ func fetchApplyLink(jobURL string) (string, error) {
 				}
 			}
 
-			// Check for alternative apply button
 			alternativeApplyButton := doc.Find("a[data-tracking-control-name='public_jobs_apply-link']")
 			if alternativeApplyButton.Length() > 0 {
 				applyURL, exists := alternativeApplyButton.Attr("href")
@@ -504,7 +825,6 @@ func extractExternalURL(urlStr string) string {
 		return urlStr
 	}
 
-	// Check if this is a LinkedIn redirect URL
 	if strings.Contains(parsedURL.Host, "linkedin.com") && strings.Contains(parsedURL.Path, "/jobs/view/externalApply/") {
 		queryParams, err := url.ParseQuery(parsedURL.RawQuery)
 		if err != nil {
@@ -526,6 +846,32 @@ func extractExternalURL(urlStr string) string {
 	return urlStr
 }
 
+func cleanField(s string) string {
+	s = strings.TrimSpace(s)
+	s = regexp.MustCompile(`^(Seniority level|Job function|Employment type):\s*`).ReplaceAllString(s, "")
+	s = regexp.MustCompile(`\s+`).ReplaceAllString(s, " ")
+	return s
+}
+
+func sanitizeString(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return -1
+		}
+		return r
+	}, s)
+
+	s = strings.Replace(s, "\\", "\\\\", -1)
+	s = strings.Replace(s, "\"", "\\\"", -1)
+	s = strings.Replace(s, "\n", "\\n", -1)
+	s = strings.Replace(s, "\r", "\\r", -1)
+	s = strings.Replace(s, "\t", "\\t", -1)
+	s = strings.Replace(s, "\f", "\\f", -1)
+	s = strings.Replace(s, "\b", "\\b", -1)
+
+	return cleanField(s)
+}
+
 func scrapeLinkedinJobs(c *gin.Context) {
 	var searchParams JobSearchParams
 	if err := c.ShouldBindJSON(&searchParams); err != nil {
@@ -533,100 +879,341 @@ func scrapeLinkedinJobs(c *gin.Context) {
 		return
 	}
 
-	log.Printf("Received request from %s", c.ClientIP())
-
-	jobs, err := scrapeJobs(searchParams)
-	if err != nil {
-		log.Printf("Error scraping jobs: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error scraping jobs"})
-		return
-	}
-
-	if len(jobs) == 0 {
-		log.Println("No jobs found matching the criteria")
-		c.JSON(http.StatusNotFound, gin.H{"error": "No jobs found matching the criteria"})
-		return
-	}
-
-	log.Printf("Total jobs fetched: %d", len(jobs))
-
-	// Filter out existing job IDs provided by the user
-	existingJobIDs := make(map[string]bool)
-	for _, id := range searchParams.ExistingJobIds {
-		existingJobIDs[id] = true
-	}
-	filteredJobs := make([]JobInfo, 0)
-	for _, job := range jobs {
-		if !existingJobIDs[job.JobID] {
-			filteredJobs = append(filteredJobs, job)
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		task := ScrapeTask{
+			Params: searchParams,
+			Result: make(chan []JobInfo, 1),
 		}
-	}
-	log.Printf("Jobs after filtering existing IDs: %d", len(filteredJobs))
 
-	// Apply time-based filter if specified
-	if searchParams.MaxAgeDays != nil {
-		currentTime := time.Now()
-		timeFilteredJobs := make([]JobInfo, 0)
-		for _, job := range filteredJobs {
-			if job.Date != "" {
-				jobDate, err := time.Parse(time.RFC3339, job.Date)
-				if err == nil {
-					if currentTime.Sub(jobDate).Hours()/24 <= float64(*searchParams.MaxAgeDays) {
-						timeFilteredJobs = append(timeFilteredJobs, job)
-					}
+		select {
+		case taskQueue <- task:
+			workerControl <- true // Acquire worker control
+		default:
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Server is busy, please try again later"})
+			return
+		}
+
+		select {
+		case result := <-task.Result:
+			if result == nil {
+				log.Printf("Attempt %d: Failed to scrape jobs", attempt+1)
+				if attempt == maxRetries-1 {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scrape jobs after multiple attempts"})
+					return
 				}
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+				continue
 			}
+			if len(result) == 0 {
+				log.Println("No jobs found matching the criteria")
+				c.JSON(http.StatusNotFound, gin.H{"error": "No jobs found matching the criteria"})
+				return
+			}
+			if len(result) > searchParams.Limit {
+				result = result[:searchParams.Limit]
+			}
+			log.Printf("Returning %d jobs to client", len(result))
+
+			for i := range result {
+				result[i].JobID = sanitizeString(result[i].JobID)
+				result[i].Title = sanitizeString(result[i].Title)
+				result[i].Company = sanitizeString(result[i].Company)
+				result[i].CompanyLink = sanitizeString(result[i].CompanyLink)
+				result[i].CompanyImgLink = sanitizeString(result[i].CompanyImgLink)
+				result[i].Place = sanitizeString(result[i].Place)
+				result[i].Date = sanitizeString(result[i].Date)
+				result[i].Link = sanitizeString(result[i].Link)
+				result[i].SeniorityLevel = sanitizeString(result[i].SeniorityLevel)
+				result[i].JobFunction = sanitizeString(result[i].JobFunction)
+				result[i].EmploymentType = sanitizeString(result[i].EmploymentType)
+				result[i].Description = sanitizeString(result[i].Description)
+				result[i].DescriptionHTML = sanitizeString(result[i].DescriptionHTML)
+				result[i].ApplyLink = sanitizeString(result[i].ApplyLink)
+				result[i].CompanyApplyURL = sanitizeString(result[i].CompanyApplyURL)
+			}
+
+			var buf bytes.Buffer
+			encoder := json.NewEncoder(&buf)
+			encoder.SetEscapeHTML(false)
+			encoder.SetIndent("", "  ")
+
+			response := map[string]interface{}{
+				"message": "Jobs scraped successfully",
+				"jobs":    result,
+			}
+			if err := encoder.Encode(response); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encode response"})
+				return
+			}
+
+			c.Header("Content-Type", "application/json")
+			c.String(http.StatusOK, buf.String())
+			return
+
+		case <-time.After(600 * time.Second):
+			log.Printf("Attempt %d: Request timed out", attempt+1)
+			if attempt == maxRetries-1 {
+				c.JSON(http.StatusRequestTimeout, gin.H{"error": "Request timed out after multiple attempts"})
+				return
+			}
+			time.Sleep(time.Duration(attempt+1) * time.Second)
 		}
-		filteredJobs = timeFilteredJobs
-		log.Printf("Jobs after applying time-based filter: %d", len(filteredJobs))
 	}
-
-	// Sort jobs by date (newest first) and limit to the requested number
-	sort.Slice(filteredJobs, func(i, j int) bool {
-		return filteredJobs[i].Date > filteredJobs[j].Date
-	})
-	if len(filteredJobs) > searchParams.Limit {
-		filteredJobs = filteredJobs[:searchParams.Limit]
-	}
-	log.Printf("Jobs after sorting and limiting: %d", len(filteredJobs))
-
-	// Fetch apply links for each job
-	var wg sync.WaitGroup
-	for i := range filteredJobs {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			applyLink, err := fetchApplyLink(filteredJobs[i].Link)
-			if err != nil {
-				log.Printf("Error fetching apply link for job %s: %v", filteredJobs[i].JobID, err)
-			} else {
-				filteredJobs[i].CompanyApplyURL = applyLink
-				filteredJobs[i].ApplyLink = applyLink
-			}
-		}(i)
-	}
-	wg.Wait()
-
-	log.Printf("Successfully scraped %d jobs", len(filteredJobs))
-	c.JSON(http.StatusOK, filteredJobs)
 }
 
-func logRequestBody(c *gin.Context) {
-	bodyBytes, err := ioutil.ReadAll(c.Request.Body)
-	if err != nil {
-		log.Printf("Error reading request body: %v", err)
-		c.AbortWithStatus(http.StatusInternalServerError)
+// Add this new struct
+type JobStatusRequest struct {
+	JobID string `json:"jobId" binding:"required"`
+}
+
+// Add this new function
+func checkJobStatus(c *gin.Context) {
+	var request JobStatusRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes)) // Restore the body for further use
-	log.Printf("Received request from %s with body: %s", c.ClientIP(), string(bodyBytes))
-	c.Next()
+
+	jobURL := fmt.Sprintf("https://www.linkedin.com/jobs/view/%s", request.JobID)
+
+	statusCode, err := intelligentRetry(func() (int, error) {
+		if err := adaptiveLimiter.Wait(context.Background()); err != nil {
+			return 0, err
+		}
+
+		result, err := cb.Execute(func() (interface{}, error) {
+			return fetchJobStatusWithStatusCode(jobURL)
+		})
+
+		if err != nil {
+			adaptiveLimiter.Failure()
+			if err == gobreaker.ErrOpenState {
+				return 0, fmt.Errorf("circuit breaker is open")
+			}
+			return 0, err
+		}
+
+		statusCode := result.(int)
+		adaptiveLimiter.Success()
+		return statusCode, nil
+	})
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	switch statusCode {
+	case 200:
+		c.JSON(http.StatusOK, gin.H{"active": true})
+	case 404:
+		c.JSON(http.StatusOK, gin.H{"active": false})
+	case 999:
+		c.JSON(http.StatusOK, gin.H{"active": false})
+	default:
+		c.JSON(http.StatusOK, gin.H{"active": true, "note": fmt.Sprintf("Unexpected status code: %d", statusCode)})
+	}
+}
+
+// Modified fetchJobStatusWithStatusCode function
+func fetchJobStatusWithStatusCode(url string) (int, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	log.Printf("HTTP request to %s returned status code %d", url, resp.StatusCode)
+
+	if resp.StatusCode == 429 {
+		return 429, fmt.Errorf("rate limited")
+	}
+
+	return resp.StatusCode, nil
+}
+
+// New function to fetch page and return status code
+func fetchPageWithStatusCode(url string, retries int, minDelay, maxDelay, postLoadDelay time.Duration) (string, int, error) {
+	backoff := minDelay
+
+	for attempt := 0; attempt < retries; attempt++ {
+		// Wait for rate limiter
+		if err := limiter.Wait(context.Background()); err != nil {
+			return "", 0, fmt.Errorf("rate limiter error: %v", err)
+		}
+
+		// Use the circuit breaker
+		result, err := cb.Execute(func() (interface{}, error) {
+			req, err := http.NewRequest("GET", url, nil)
+			if err != nil {
+				return nil, err
+			}
+
+			req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
+
+			log.Printf("Attempt %d/%d: Fetching URL %s", attempt+1, retries, url)
+
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+
+			log.Printf("HTTP request to %s returned status code %d", url, resp.StatusCode)
+
+			if resp.StatusCode == 429 {
+				retryAfter := resp.Header.Get("Retry-After")
+				sleepDuration := parseRetryAfter(retryAfter)
+				if sleepDuration == 0 {
+					sleepDuration = calculateBackoff(backoff, maxDelay)
+				}
+				log.Printf("Rate limited. Sleeping for %v before retrying...", sleepDuration)
+				time.Sleep(sleepDuration)
+				backoff = sleepDuration
+				return nil, fmt.Errorf("rate limited")
+			}
+
+			// Wait for the page to "load"
+			log.Printf("Waiting %v for page to load...", postLoadDelay)
+			time.Sleep(postLoadDelay)
+
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				return nil, err
+			}
+
+			return map[string]interface{}{
+				"body":       string(body),
+				"statusCode": resp.StatusCode,
+			}, nil
+		})
+
+		if err != nil {
+			if attempt < retries-1 {
+				backoff = calculateBackoff(backoff, maxDelay)
+				log.Printf("Request failed. Retrying in %v", backoff)
+				time.Sleep(backoff)
+				continue
+			}
+			return "", 0, err
+		}
+
+		// Type assert the result
+		resultMap, ok := result.(map[string]interface{})
+		if !ok {
+			return "", 0, fmt.Errorf("unexpected result type from circuit breaker")
+		}
+
+		body, ok := resultMap["body"].(string)
+		if !ok {
+			return "", 0, fmt.Errorf("body is not a string")
+		}
+
+		statusCode, ok := resultMap["statusCode"].(int)
+		if !ok {
+			return "", 0, fmt.Errorf("statusCode is not an int")
+		}
+
+		return body, statusCode, nil
+	}
+
+	return "", 429, fmt.Errorf("failed to fetch page after %d attempts", retries)
+}
+
+func calculateBackoff(current, max time.Duration) time.Duration {
+	backoff := current * 2
+	if backoff > max {
+		backoff = max
+	}
+	// Add more jitter
+	jitter := time.Duration(rand.Int63n(int64(backoff)))
+	return backoff + jitter
+}
+
+func parseRetryAfter(retryAfter string) time.Duration {
+	if retryAfter == "" {
+		return 0
+	}
+	seconds, err := strconv.Atoi(retryAfter)
+	if err != nil {
+		log.Printf("Failed to parse Retry-After header: %v", err)
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func parseJobsFromPage(pageContent string) []JobInfo {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(pageContent))
+	if err != nil {
+		log.Printf("Error parsing HTML: %v", err)
+		return nil
+	}
+
+	var jobs []JobInfo
+	doc.Find("li .job-search-card").Each(func(i int, s *goquery.Selection) {
+		job := JobInfo{}
+
+		// Extract job ID from the data-entity-urn attribute
+		if entityUrn, exists := s.Attr("data-entity-urn"); exists {
+			parts := strings.Split(entityUrn, ":")
+			if len(parts) > 0 {
+				job.JobID = parts[len(parts)-1]
+			}
+		}
+
+		// Extract job title
+		job.Title = strings.TrimSpace(s.Find(".base-search-card__title").Text())
+
+		// Extract company name and link
+		companyElem := s.Find(".base-search-card__subtitle a")
+		job.Company = strings.TrimSpace(companyElem.Text())
+		if companyLink, exists := companyElem.Attr("href"); exists {
+			job.CompanyLink = companyLink
+		}
+
+		// Extract company image
+		if imgSrc, exists := s.Find(".search-entity-media img").Attr("data-delayed-url"); exists {
+			job.CompanyImgLink = imgSrc
+		}
+
+		// Extract location
+		job.Place = strings.TrimSpace(s.Find(".job-search-card__location").Text())
+
+		// Extract posting date
+		dateElem := s.Find(".job-search-card__listdate")
+		if dateStr, exists := dateElem.Attr("datetime"); exists {
+			job.Date = dateStr
+		}
+
+		// Extract job link
+		if link, exists := s.Find("a.base-card__full-link").Attr("href"); exists {
+			job.Link = strings.Split(link, "?")[0] // Remove query parameters
+		}
+
+		// Only append jobs that have at least an ID and title
+		if job.JobID != "" && job.Title != "" {
+			log.Printf("Found job: %s at %s", job.Title, job.Company)
+			jobs = append(jobs, job)
+		}
+	})
+
+	log.Printf("Successfully parsed %d jobs from page", len(jobs))
+	return jobs
 }
 
 func main() {
-	r := gin.Default()
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
 
-	// Add CORS middleware
 	config := cors.DefaultConfig()
 	config.AllowAllOrigins = true
 	config.AllowCredentials = true
@@ -634,18 +1221,41 @@ func main() {
 	config.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type", "Authorization"}
 	r.Use(cors.New(config))
 
-	// Add request logging middleware
-	r.Use(logRequestBody)
-
-	// Add root route
 	r.GET("/", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
 
 	r.POST("/scrape", scrapeLinkedinJobs)
 
-	log.Println("Starting server on :8080")
-	if err := r.Run(":8080"); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	// Add this new endpoint
+	r.POST("/check-job-status", checkJobStatus)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8085"
 	}
+
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal("Server forced to shutdown:", err)
+	}
+
+	log.Println("Server exiting")
 }
